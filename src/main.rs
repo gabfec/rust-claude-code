@@ -1,7 +1,7 @@
 use async_openai::{Client, config::OpenAIConfig};
 use clap::Parser;
 use serde_json::{Value, json};
-use std::{env, process};
+use std::{env, process, fs};
 
 #[derive(Parser)]
 #[command(author, version, about)]
@@ -50,6 +50,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "required": ["file_path"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "Write",
+                "description": "Write content to a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "The path of the file to write to"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "The content to write to the file"
+                        }
+                    },
+                    "required": ["file_path", "content"]
+                }
+            }
         }
     ]);
 
@@ -72,21 +93,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // If there are tool calls
         if let Some(tool_calls) = message["tool_calls"].as_array() {
             for tool_call in tool_calls {
-                let id = tool_call["id"].as_str().unwrap();
-                let name = tool_call["function"]["name"].as_str().unwrap();
+                let tool_id = tool_call["id"].as_str().unwrap();
+                let function_name = tool_call["function"]["name"].as_str().unwrap();
                 let arguments_str = tool_call["function"]["arguments"].as_str().unwrap();
                 let arguments: Value = serde_json::from_str(arguments_str)?;
 
-                if name == "Read" {
-                    let file_path = arguments["file_path"].as_str().unwrap();
-                    let contents = std::fs::read_to_string(file_path)
-                        .unwrap_or_else(|e| format!("Error: {}", e));
+                match function_name {
+                    "Read" => {
+                        let file_path = arguments["file_path"].as_str().unwrap();
+                        let contents = fs::read_to_string(file_path)
+                            .unwrap_or_else(|e| format!("Error: {}", e));
 
-                    messages.push(json!({
-                            "role": "tool",
-                            "tool_call_id": id,
-                            "content": contents
-                    }));
+                        messages.push(json!({
+                                "role": "tool",
+                                "tool_call_id": tool_id,
+                                "content": contents
+                        }));
+                    }
+                    "Write" => {
+                        let file_path = arguments["file_path"].as_str().unwrap();
+                        let content = arguments["content"].as_str().unwrap();
+                        let _ = fs::write(file_path, content);
+                        messages.push(json!({
+                                "role": "tool",
+                                "tool_call_id": tool_id,
+                                "content": content
+                        }));
+                    }
+                    _ => {
+                        eprintln!("Unknown function: {}", function_name);
+                    }
                 }
             }
 
