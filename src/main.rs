@@ -1,7 +1,7 @@
 use async_openai::{Client, config::OpenAIConfig};
 use clap::Parser;
 use serde_json::{Value, json};
-use std::{env, process, fs};
+use std::{env, fs, process::{self, Command}};
 
 #[derive(Parser)]
 #[command(author, version, about)]
@@ -71,6 +71,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "required": ["file_path", "content"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "Bash",
+                "description": "Execute a shell command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The command to execute"
+                        }
+                    },
+                    "required": ["command"]
+                }
+            }
         }
     ]);
 
@@ -114,6 +131,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let file_path = arguments["file_path"].as_str().unwrap();
                         let content = arguments["content"].as_str().unwrap();
                         let _ = fs::write(file_path, content);
+                        messages.push(json!({
+                                "role": "tool",
+                                "tool_call_id": tool_id,
+                                "content": content
+                        }));
+                    }
+                    "Bash" => {
+                        let command = arguments["command"].as_str().unwrap();
+                        let output = Command::new("sh").arg("-c").arg(command).output()?;
+                        let content = String::from_utf8_lossy(&output.stdout).to_string();
                         messages.push(json!({
                                 "role": "tool",
                                 "tool_call_id": tool_id,
