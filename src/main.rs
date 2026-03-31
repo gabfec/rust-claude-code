@@ -28,57 +28,77 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client = Client::with_config(config);
 
-    #[allow(unused_variables)]
-    let response: Value = client
-        .chat()
-        .create_byot(json!({
-            "messages": [
-                {
-                    "role": "user",
-                    "content": args.prompt
-                }
-            ],
-            "model": "anthropic/claude-haiku-4.5",
-            "tools": [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "Read",
-                        "description": "Read and return the contents of a file",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "file_path": {
-                                    "type": "string",
-                                    "description": "The path to the file to read"
-                                }
-                            },
-                            "required": ["file_path"]
+    let mut messages = vec![json!({
+        "role": "user",
+        "content": args.prompt
+    })];
+
+    let tools = json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "Read",
+                "description": "Read and return the contents of a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "The path to the file to read"
                         }
-                    }
+                    },
+                    "required": ["file_path"]
                 }
-            ]
-        }))
-        .await?;
-
-    // You can use print statements as follows for debugging, they'll be visible when running tests.
-    eprintln!("Logs from your program will appear here!");
-
-    let message = &response["choices"][0]["message"];
-
-    if let Some(content) = message["content"].as_str() {
-         println!("{}", content);
-    } else  if let Some(tool_calls) = message["tool_calls"].as_array() {
-        let tool_call = &tool_calls[0];
-        let name = tool_call["function"]["name"].as_str().unwrap();
-        let arguments: Value =
-            serde_json::from_str(tool_call["function"]["arguments"].as_str().unwrap())?;
-
-        if name == "Read" {
-            let file_path = arguments["file_path"].as_str().unwrap();
-            let contents = std::fs::read_to_string(file_path)?;
-            print!("{}", contents);
+            }
         }
+    ]);
+
+    loop {
+        let response: Value = client
+            .chat()
+            .create_byot(json!({
+                "messages": messages,
+                "model": "anthropic/claude-haiku-4.5",
+                "tools": tools
+            }))
+            .await?;
+
+        let choice = &response["choices"][0];
+        let message = &choice["message"];
+
+        // Add the assistant's message to history
+        messages.push(message.clone());
+
+        // If there are tool calls
+        if let Some(tool_calls) = message["tool_calls"].as_array() {
+            for tool_call in tool_calls {
+                let id = tool_call["id"].as_str().unwrap();
+                let name = tool_call["function"]["name"].as_str().unwrap();
+                let arguments_str = tool_call["function"]["arguments"].as_str().unwrap();
+                let arguments: Value = serde_json::from_str(arguments_str)?;
+
+                if name == "Read" {
+                    let file_path = arguments["file_path"].as_str().unwrap();
+                    let contents = std::fs::read_to_string(file_path)
+                        .unwrap_or_else(|e| format!("Error: {}", e));
+
+                    messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": id,
+                            "content": contents
+                    }));
+                }
+            }
+
+            continue;
+        }
+
+        // No more tool calls
+        if let Some(content) = message["content"].as_str() {
+            print!("{}", content);
+        }
+
+        break;
     }
 
     Ok(())
