@@ -515,9 +515,9 @@ pub fn uri_to_path(uri: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::TempDir;
     use std::collections::VecDeque;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Records every call, answers requests from a queue of canned
     /// results, and serves a notification queue with a cursor.
@@ -592,41 +592,19 @@ mod tests {
     const CHECKOUT: &str = "from pricing import total as invoice_total\n\n\ndef checkout_total() -> int:\n    return invoice_total(250, 2)\n";
     const PRICING: &str = "def total(price: int, quantity: int) -> int:\n    return price * quantity\n";
 
-    /// A temporary project folder, removed when dropped.
-    struct Project(PathBuf);
-
-    impl std::ops::Deref for Project {
-        type Target = Path;
-        fn deref(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for Project {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
     /// An `Lsp` over a fake transport, rooted in a fresh project folder
     /// holding checkout.py, pricing.py and notes.txt.
-    fn setup() -> (Lsp, FakeTransport, Project) {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "lsp-test-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::SeqCst)
-        ));
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("checkout.py"), CHECKOUT).unwrap();
-        fs::write(root.join("pricing.py"), PRICING).unwrap();
-        fs::write(root.join("notes.txt"), "notes").unwrap();
+    fn setup() -> (Lsp, FakeTransport, TempDir) {
+        let root = TempDir::new("lsp");
+        root.write("checkout.py", CHECKOUT);
+        root.write("pricing.py", PRICING);
+        root.write("notes.txt", "notes");
 
         let fake = FakeTransport {
             languages: HashMap::from([(".py".to_string(), "python".to_string())]),
             ..Default::default()
         };
-        (Lsp::new(fake.clone(), root.clone()), fake, Project(root))
+        (Lsp::new(fake.clone(), root.to_path_buf()), fake, root)
     }
 
     fn uri(root: &Path, file: &str) -> String {

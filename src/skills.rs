@@ -262,6 +262,7 @@ fn strip_comment(value: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::TempDir;
 
     #[test]
     fn substitutes_all_placeholder_kinds() {
@@ -306,7 +307,8 @@ mod tests {
 
     #[test]
     fn instructions_name_the_folder_only_with_bundled_files() {
-        let dir = std::env::temp_dir().join(format!("skill-test-{}", std::process::id()));
+        let tmp = TempDir::new("bundled");
+        let dir = tmp.join("apple");
         fs::create_dir_all(dir.join("scripts")).unwrap();
         fs::write(dir.join("SKILL.md"), "---\nname: apple\n---\n").unwrap();
 
@@ -324,7 +326,60 @@ mod tests {
 
         fs::remove_dir_all(dir.join("scripts")).unwrap();
         assert_eq!(apple.instructions(""), "Run `scripts/x.sh`.");
-        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn discovers_skill_folders_sorted_by_name() {
+        let tmp = TempDir::new("discover");
+        tmp.write(
+            "grape/SKILL.md",
+            "---\nname: grape\ndescription: Formats source code.\ncontext: fork\n---\n\nFormat it.\n",
+        );
+        tmp.write(
+            "apple/SKILL.md",
+            "---\nname: apple\ndescription: 'Deploys: the apple service.'\n---\n\nDeploy $0.\n",
+        );
+        tmp.write("no-skill-file/README.md", "not a skill");
+        tmp.write("stray.md", "not a folder");
+
+        let skills = discover(&tmp);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["apple", "grape"]);
+
+        let (apple, grape) = (&skills[0], &skills[1]);
+        assert_eq!(apple.description, "Deploys: the apple service.");
+        assert_eq!(apple.body, "Deploy $0.");
+        assert_eq!(apple.dir, tmp.join("apple").to_string_lossy());
+        assert!(!apple.fork);
+        assert!(grape.fork);
+    }
+
+    #[test]
+    fn missing_skills_directory_means_no_skills() {
+        let tmp = TempDir::new("no-skills");
+        assert!(discover(&tmp.join("absent")).is_empty());
+    }
+
+    #[test]
+    fn system_prompt_lists_names_and_descriptions_only() {
+        let mut apple = skill("apple", "SECRET BODY");
+        apple.description = "Deploys the apple service.".into();
+        let prompt = system_prompt(&[apple]);
+
+        assert!(prompt.starts_with("You have access to the following skills:\n\n"));
+        assert!(prompt.contains("- apple: Deploys the apple service.\n"));
+        assert!(prompt.contains("call the Skill tool"));
+        assert!(!prompt.contains("SECRET BODY"));
+    }
+
+    #[test]
+    fn a_forked_skill_is_never_stacked() {
+        let mut fork = skill("fork", "f-$ARGUMENTS");
+        fork.fork = true;
+        let skills = [skill("apple", "a-$ARGUMENTS"), fork];
+
+        assert_eq!(expand_prompt(&skills, "/apple /fork 1"), ["a-/fork 1"]);
+        assert_eq!(expand_prompt(&skills, "/fork /apple 1"), ["f-/apple 1"]);
     }
 
     #[test]

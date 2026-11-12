@@ -6,6 +6,8 @@ use std::{env, error::Error, fs, path::Path, process::{self, Command}};
 mod lsp;
 mod lsp_client;
 mod skills;
+#[cfg(test)]
+mod test_util;
 
 use lsp::Lsp;
 use lsp_client::LspClient;
@@ -350,4 +352,129 @@ async fn main() -> Result<(), Box<dyn Error>> {
     print!("{}", answer);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::TempDir;
+
+    /// An agent with no model behind it: fine for every tool except a
+    /// forked skill, which would need to call the model.
+    fn agent(skills: Vec<Skill>) -> Agent {
+        Agent {
+            client: Client::with_config(OpenAIConfig::new()),
+            skills,
+            tools: tool_definitions(),
+            lsp: None,
+        }
+    }
+
+    fn skill(name: &str, body: &str) -> Skill {
+        Skill {
+            name: name.into(),
+            description: format!("The {name} skill."),
+            body: body.into(),
+            dir: format!("{}/{name}", skills::SKILLS_DIR),
+            fork: false,
+        }
+    }
+
+    async fn call(agent: &Agent, tool: &str, arguments: Value) -> String {
+        agent.execute_tool(tool, &arguments).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn read_returns_contents_or_an_error() {
+        let tmp = TempDir::new("read");
+        let path = tmp.write("pineapple.py", "print('Hello, program!')\n");
+        let agent = agent(vec![]);
+
+        let read = call(&agent, "Read", json!({ "file_path": path })).await;
+        assert_eq!(read, "print('Hello, program!')\n");
+
+        let missing = call(&agent, "Read", json!({ "file_path": tmp.join("absent.py") })).await;
+        assert!(missing.starts_with("Error: "), "{missing}");
+    }
+
+    #[tokio::test]
+    async fn write_saves_the_file_and_echoes_its_content() {
+        let tmp = TempDir::new("write");
+        let path = tmp.join("start.py");
+        let agent = agent(vec![]);
+
+        let result = call(
+            &agent,
+            "Write",
+            json!({ "file_path": path, "content": "print(\"Hello world\")\n" }),
+        )
+        .await;
+        assert_eq!(result, "print(\"Hello world\")\n");
+        assert_eq!(fs::read_to_string(&path).unwrap(), result);
+
+        let unwritable = tmp.join("no-such-folder/file.py");
+        let error = call(&agent, "Write", json!({ "file_path": unwritable, "content": "x" })).await;
+        assert!(error.starts_with("Error: "), "{error}");
+    }
+
+    #[tokio::test]
+    async fn bash_returns_stdout_then_stderr() {
+        let agent = agent(vec![]);
+        let output = call(&agent, "Bash", json!({ "command": "echo out; echo err >&2" })).await;
+        assert_eq!(output, "out\nerr\n");
+    }
+
+    #[tokio::test]
+    async fn skill_returns_the_body_with_arguments() {
+        let agent = agent(vec![skill("apple", "Deploy to $0 in $1.")]);
+
+        let body = call(&agent, "Skill", json!({ "name": "apple", "args": "staging eu" })).await;
+        assert_eq!(body, "Deploy to staging in eu.");
+
+        let without_args = call(&agent, "Skill", json!({ "name": "apple" })).await;
+        assert_eq!(without_args, "Deploy to  in .");
+    }
+
+    #[tokio::test]
+    async fn unknown_skills_and_tools_get_an_error_result() {
+        let agent = agent(vec![]);
+        assert_eq!(
+            call(&agent, "Skill", json!({ "name": "pear" })).await,
+            "Error: unknown skill `pear`"
+        );
+        assert_eq!(call(&agent, "Teleport", json!({})).await, "Error: unknown tool `Teleport`");
+        // Without a language server, LSP is not one of the agent's tools.
+        assert_eq!(call(&agent, "LSP", json!({})).await, "Error: unknown tool `LSP`");
+    }
+
+    #[test]
+    fn tools_are_advertised_with_their_required_arguments() {
+        let required = |tool: &Value| -> (String, Value) {
+            (
+                tool["function"]["name"].as_str().unwrap().to_string(),
+                tool["function"]["parameters"]["required"].clone(),
+            )
+        };
+        let tools: Vec<(String, Value)> =
+            tool_definitions().as_array().unwrap().iter().map(required).collect();
+        assert_eq!(
+            tools,
+            [
+                ("Read".to_string(), json!(["file_path"])),
+                ("Write".to_string(), json!(["file_path", "content"])),
+                ("Bash".to_string(), json!(["command"])),
+                ("Skill".to_string(), json!(["name"])),
+            ]
+        );
+
+        let lsp = lsp_tool_definition();
+        assert_eq!(
+            required(&lsp),
+            ("LSP".to_string(), json!(["operation", "filePath", "line", "character"]))
+        );
+        assert_eq!(
+            lsp["function"]["parameters"]["properties"]["operation"]["enum"],
+            json!(["goToDefinition", "findReferences"])
+        );
+    }
 }
