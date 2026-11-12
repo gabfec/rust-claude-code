@@ -105,6 +105,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "required": ["command"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "Skill",
+                "description": "Load a skill's instructions into the conversation",
+                "parameters": {
+                    "type": "object",
+                    "required": ["name"],
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "The name of the skill to use"
+                        },
+                        "args": {
+                            "type": "string",
+                            "description": "Optional arguments for the skill"
+                        }
+                    }
+                }
+            }
         }
     ]);
 
@@ -164,8 +185,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "content": content
                         }));
                     }
+                    "Skill" => {
+                        let name = arguments["name"].as_str().unwrap_or("");
+                        let skill_args = arguments["args"].as_str().unwrap_or("");
+                        let content = match skills.iter().find(|s| s.name == name) {
+                            Some(skill) => skill.instructions(skill_args),
+                            None => format!("Error: unknown skill `{}`", name),
+                        };
+                        messages.push(json!({
+                                "role": "tool",
+                                "tool_call_id": tool_id,
+                                "content": content
+                        }));
+                    }
                     _ => {
                         eprintln!("Unknown function: {}", function_name);
+                        messages.push(json!({
+                                "role": "tool",
+                                "tool_call_id": tool_id,
+                                "content": format!("Error: unknown tool `{}`", function_name)
+                        }));
                     }
                 }
             }

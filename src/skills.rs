@@ -156,6 +156,10 @@ pub fn system_prompt(skills: &[Skill]) -> String {
     for skill in skills {
         prompt.push_str(&format!("- {}: {}\n", skill.name, skill.description));
     }
+    prompt.push_str(
+        "\nIf a skill matches the user's request, call the Skill tool with its name\n\
+         and follow the instructions it returns.\n",
+    );
     prompt
 }
 
