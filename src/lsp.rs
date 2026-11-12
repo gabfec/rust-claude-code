@@ -67,6 +67,17 @@ impl Lsp {
                     .collect::<Vec<_>>()
                     .join("\n"))
             }
+            "findReferences" => {
+                let result = self.request(
+                    "textDocument/references",
+                    json!({
+                        "textDocument": { "uri": uri },
+                        "position": position,
+                        "context": { "includeDeclaration": true }
+                    }),
+                )?;
+                Ok(self.format_references(&parse_locations(&result)))
+            }
             other => Err(format!("unsupported operation `{}`", other).into()),
         }
     }
@@ -138,6 +149,42 @@ impl Lsp {
         path.strip_prefix(&self.root)
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| path.to_string_lossy().into_owned())
+    }
+
+    /// Lists every location, grouped by file in the order the server
+    /// returned them.
+    fn format_references(&self, locations: &[Location]) -> String {
+        if locations.is_empty() {
+            return "No references found.".to_string();
+        }
+
+        let mut files: Vec<(String, Vec<&Location>)> = Vec::new();
+        for location in locations {
+            let file = self.relative(&location.uri);
+            match files.iter_mut().find(|(f, _)| *f == file) {
+                Some((_, group)) => group.push(location),
+                None => files.push((file, vec![location])),
+            }
+        }
+
+        let mut out = format!(
+            "Found {} reference{} across {} file{}:\n",
+            locations.len(),
+            if locations.len() == 1 { "" } else { "s" },
+            files.len(),
+            if files.len() == 1 { "" } else { "s" },
+        );
+        for (file, group) in files {
+            out.push_str(&format!("\n{}:\n", file));
+            for location in group {
+                out.push_str(&format!(
+                    "  Line {}:{}\n",
+                    location.line + 1,
+                    location.character + 1
+                ));
+            }
+        }
+        out.trim_end().to_string()
     }
 
     fn display_location(&self, location: &Location) -> String {

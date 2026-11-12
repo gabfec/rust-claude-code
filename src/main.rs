@@ -138,13 +138,13 @@ fn lsp_tool_definition() -> Value {
         "type": "function",
         "function": {
             "name": "LSP",
-            "description": "Ask the language server about code. goToDefinition returns the file, line, and character where the symbol at the given position is defined. Line and character are 1-based, as shown in an editor.",
+            "description": "Ask the language server about the symbol at a position in a file. goToDefinition returns the file, line, and character where the symbol is defined. findReferences returns every location that references the symbol, including its declaration. Line and character are 1-based, as shown in an editor.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "operation": {
                         "type": "string",
-                        "enum": ["goToDefinition"]
+                        "enum": ["goToDefinition", "findReferences"]
                     },
                     "filePath": {
                         "type": "string",
