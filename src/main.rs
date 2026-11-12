@@ -1,7 +1,7 @@
 use async_openai::{Client, config::OpenAIConfig};
 use clap::Parser;
 use serde_json::{Value, json};
-use std::{env, error::Error, fs, process::{self, Command}};
+use std::{env, error::Error, fs, path::Path, process::{self, Command}};
 
 mod lsp;
 mod lsp_client;
@@ -315,7 +315,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let agent = Agent {
         client: Client::with_config(config),
-        skills: skills::discover(),
+        skills: skills::discover(Path::new(skills::SKILLS_DIR)),
         tools,
         lsp: lsp.map(|client| Lsp::new(client, env::current_dir().unwrap_or_default())),
     };

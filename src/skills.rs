@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Where skills live, relative to the project directory.
 pub const SKILLS_DIR: &str = ".claude/skills";
 
 #[derive(Debug, Clone)]
@@ -9,7 +10,8 @@ pub struct Skill {
     pub name: String,
     pub description: String,
     pub body: String,
-    /// Project-relative folder holding SKILL.md and bundled files.
+    /// Folder holding SKILL.md and bundled files, as given to `discover`
+    /// (project-relative in normal use).
     pub dir: String,
     /// `context: fork` — run the skill in a subagent.
     pub fork: bool,
@@ -25,7 +27,7 @@ impl Skill {
         Some(Skill {
             // Skills are invoked by folder name, which the standard
             // requires to match the frontmatter name.
-            dir: format!("{SKILLS_DIR}/{folder_name}"),
+            dir: dir.to_string_lossy().into_owned(),
             name: folder_name,
             description: fields.get("description").cloned().unwrap_or_default(),
             body: body.trim().to_string(),
@@ -61,9 +63,9 @@ impl Skill {
     }
 }
 
-/// Finds every `.claude/skills/<name>/SKILL.md`, sorted by name.
-pub fn discover() -> Vec<Skill> {
-    let Ok(entries) = fs::read_dir(SKILLS_DIR) else {
+/// Finds every `<skills_dir>/<name>/SKILL.md`, sorted by name.
+pub fn discover(skills_dir: &Path) -> Vec<Skill> {
+    let Ok(entries) = fs::read_dir(skills_dir) else {
         return Vec::new();
     };
 
