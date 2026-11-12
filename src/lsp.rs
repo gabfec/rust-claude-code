@@ -12,20 +12,49 @@ use crate::lsp_client::LspClient;
 const SETTLE_WAIT_MS: u64 = 300;
 const SETTLE_ROUNDS: usize = 5;
 
+/// How `Lsp` reaches the language server. `LspClient` is the real
+/// implementation; tests substitute a fake that records the calls.
+pub trait Transport {
+    /// Sends an action (`notify`, `request`, `notifications`) with its
+    /// payload and returns the response.
+    fn call(&self, action: &str, payload: &Value) -> Result<Value, Box<dyn Error>>;
+    /// File extension (with the dot) -> LSP language ID.
+    fn extension_to_language(&self) -> &HashMap<String, String>;
+}
+
+impl Transport for LspClient {
+    fn call(&self, action: &str, payload: &Value) -> Result<Value, Box<dyn Error>> {
+        LspClient::call(self, action, payload)
+    }
+
+    fn extension_to_language(&self) -> &HashMap<String, String> {
+        &self.extension_to_language
+    }
+}
+
 /// The language server connection plus the state of the documents it
 /// has been sent on this connection.
 pub struct Lsp {
-    client: LspClient,
+    transport: Box<dyn Transport>,
     root: PathBuf,
     /// URI -> version last sent for every open document.
     versions: Mutex<HashMap<String, i64>>,
-    diagnostics: Mutex<DiagnosticsState>,
+    /// Cursor for the next read of the notification queue.
+    cursor: Mutex<Value>,
+    diagnostics: Mutex<Diagnostics>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Diagnostic {
+    line: u64,
+    character: u64,
+    message: String,
+}
+
+/// Tracks diagnostic reports and which of their issues the model still
+/// needs to see. Holds no connection, so it can be tested directly.
 #[derive(Default)]
-struct DiagnosticsState {
-    /// Cursor for the next read of the client's notification queue.
-    cursor: Value,
+struct Diagnostics {
     /// URI -> issues in the latest current report for that file, all
     /// of which have been shown or queued for the model.
     shown: HashMap<String, HashSet<Diagnostic>>,
@@ -33,60 +62,17 @@ struct DiagnosticsState {
     pending: Vec<(String, Diagnostic)>,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct Diagnostic {
-    line: u64,
-    character: u64,
-    message: String,
-}
-
-/// A zero-based position in a document, as LSP counts it.
-struct Location {
-    uri: String,
-    line: u64,
-    character: u64,
-}
-
-impl Lsp {
-    pub fn new(client: LspClient) -> Self {
-        Lsp {
-            client,
-            root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            versions: Mutex::new(HashMap::new()),
-            diagnostics: Mutex::new(DiagnosticsState {
-                cursor: json!(0),
-                ..Default::default()
-            }),
-        }
-    }
-
-    /// Reads queued `publishDiagnostics` reports. A report whose version
-    /// differs from the last one sent for that file is stale and ignored.
-    /// A current report replaces the file's previous one, and its issues
-    /// that weren't in the previous report are queued for the model.
+impl Diagnostics {
+    /// Applies a batch of notifications. A `publishDiagnostics` report
+    /// whose version differs from the last one sent for that file
+    /// (`versions`) is stale and ignored; a report without a version is
+    /// accepted. A current report replaces the file's previous one, and
+    /// its issues that weren't in the previous report are queued.
     ///
     /// Queued issues stay queued even if a later report clears them: the
     /// model must see every current diagnostic, and a report can arrive
     /// and be superseded between two model requests.
-    pub fn poll_diagnostics(&self) -> Result<(), Box<dyn Error>> {
-        self.read_notifications(0).map(|_| ())
-    }
-
-    /// Reads the notification queue, waiting up to `timeout_ms` for new
-    /// ones, records their diagnostic reports, and returns how many
-    /// notifications arrived.
-    fn read_notifications(&self, timeout_ms: u64) -> Result<usize, Box<dyn Error>> {
-        let mut state = self.diagnostics.lock().unwrap();
-        let response = self.client.call(
-            "notifications",
-            &json!({ "after": state.cursor, "timeoutMs": timeout_ms }),
-        )?;
-        if !response["cursor"].is_null() {
-            state.cursor = response["cursor"].clone();
-        }
-
-        let notifications = response["notifications"].as_array().map(Vec::as_slice).unwrap_or(&[]);
-        let versions = self.versions.lock().unwrap();
+    fn ingest(&mut self, notifications: &[Value], versions: &HashMap<String, i64>) {
         for notification in notifications {
             if notification["method"] != "textDocument/publishDiagnostics" {
                 continue;
@@ -114,15 +100,71 @@ impl Lsp {
                 })
                 .collect();
 
-            let previous = state.shown.remove(uri).unwrap_or_default();
+            let previous = self.shown.remove(uri).unwrap_or_default();
             for issue in &issues {
-                let queued = state.pending.iter().any(|(u, d)| u == uri && d == issue);
+                let queued = self.pending.iter().any(|(u, d)| u == uri && d == issue);
                 if !previous.contains(issue) && !queued {
-                    state.pending.push((uri.to_string(), issue.clone()));
+                    self.pending.push((uri.to_string(), issue.clone()));
                 }
             }
-            state.shown.insert(uri.to_string(), issues.into_iter().collect());
+            self.shown.insert(uri.to_string(), issues.into_iter().collect());
         }
+    }
+
+    /// Takes the queued issues, grouped by file in arrival order.
+    fn take(&mut self) -> Vec<(String, Vec<Diagnostic>)> {
+        let mut files: Vec<(String, Vec<Diagnostic>)> = Vec::new();
+        for (uri, issue) in std::mem::take(&mut self.pending) {
+            match files.iter_mut().find(|(u, _)| *u == uri) {
+                Some((_, group)) => group.push(issue),
+                None => files.push((uri, vec![issue])),
+            }
+        }
+        files
+    }
+}
+
+/// A zero-based position in a document, as LSP counts it.
+struct Location {
+    uri: String,
+    line: u64,
+    character: u64,
+}
+
+impl Lsp {
+    /// Wraps a transport; relative paths resolve against `root`.
+    pub fn new(transport: impl Transport + 'static, root: PathBuf) -> Self {
+        Lsp {
+            transport: Box::new(transport),
+            root,
+            versions: Mutex::new(HashMap::new()),
+            cursor: Mutex::new(json!(0)),
+            diagnostics: Mutex::new(Diagnostics::default()),
+        }
+    }
+
+    /// Reads the queued notifications and records their diagnostic
+    /// reports; see `Diagnostics::ingest`.
+    pub fn poll_diagnostics(&self) -> Result<(), Box<dyn Error>> {
+        self.read_notifications(0).map(|_| ())
+    }
+
+    /// Reads the notification queue, waiting up to `timeout_ms` for new
+    /// ones, records their diagnostic reports, and returns how many
+    /// notifications arrived.
+    fn read_notifications(&self, timeout_ms: u64) -> Result<usize, Box<dyn Error>> {
+        let mut cursor = self.cursor.lock().unwrap();
+        let response = self.transport.call(
+            "notifications",
+            &json!({ "after": *cursor, "timeoutMs": timeout_ms }),
+        )?;
+        if !response["cursor"].is_null() {
+            *cursor = response["cursor"].clone();
+        }
+
+        let notifications = response["notifications"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        let versions = self.versions.lock().unwrap();
+        self.diagnostics.lock().unwrap().ingest(notifications, &versions);
         Ok(notifications.len())
     }
 
@@ -147,33 +189,11 @@ impl Lsp {
     /// Formats the queued issues, grouped by file, and clears the queue.
     /// Returns `None` when there is nothing new.
     pub fn take_new_diagnostics(&self) -> Option<String> {
-        let pending = std::mem::take(&mut self.diagnostics.lock().unwrap().pending);
-        if pending.is_empty() {
+        let files = self.diagnostics.lock().unwrap().take();
+        if files.is_empty() {
             return None;
         }
-
-        let mut files: Vec<(&String, Vec<&Diagnostic>)> = Vec::new();
-        for (uri, issue) in &pending {
-            match files.iter_mut().find(|(u, _)| *u == uri) {
-                Some((_, group)) => group.push(issue),
-                None => files.push((uri, vec![issue])),
-            }
-        }
-
-        let sections: Vec<String> = files
-            .iter()
-            .map(|(uri, issues)| {
-                let lines: Vec<String> = issues
-                    .iter()
-                    .map(|d| format!("  [Line {}:{}] {}", d.line + 1, d.character + 1, d.message))
-                    .collect();
-                format!("{}:\n{}", self.relative(uri), lines.join("\n"))
-            })
-            .collect();
-        Some(format!(
-            "<new-diagnostics>The following new diagnostic issues were detected:\n\n{}</new-diagnostics>",
-            sections.join("\n\n")
-        ))
+        Some(format_diagnostics(&self.root, &files))
     }
 
     /// Executes an `LSP` tool call and returns its result text.
@@ -207,7 +227,7 @@ impl Lsp {
                 }
                 Ok(locations
                     .iter()
-                    .map(|l| format!("Defined in {}", self.display_location(l)))
+                    .map(|l| format!("Defined in {}", display_location(&self.root, l)))
                     .collect::<Vec<_>>()
                     .join("\n"))
             }
@@ -220,7 +240,7 @@ impl Lsp {
                         "context": { "includeDeclaration": true }
                     }),
                 )?;
-                Ok(self.format_references(&parse_locations(&result)))
+                Ok(format_references(&self.root, &parse_locations(&result)))
             }
             other => Err(format!("unsupported operation `{}`", other).into()),
         }
@@ -298,7 +318,7 @@ impl Lsp {
     fn mapped_language(&self, path: &Path) -> Option<String> {
         path.extension()
             .and_then(|e| e.to_str())
-            .and_then(|e| self.client.extension_to_language.get(&format!(".{e}")))
+            .and_then(|e| self.transport.extension_to_language().get(&format!(".{e}")))
             .cloned()
     }
 
@@ -308,14 +328,14 @@ impl Lsp {
     }
 
     fn notify(&self, method: &str, params: Value) -> Result<(), Box<dyn Error>> {
-        self.client
+        self.transport
             .call("notify", &json!({ "method": method, "params": params }))?;
         Ok(())
     }
 
     fn request(&self, method: &str, params: Value) -> Result<Value, Box<dyn Error>> {
         let response = self
-            .client
+            .transport
             .call("request", &json!({ "method": method, "params": params }))?;
         // Accept either the bare LSP result or a JSON-RPC style envelope.
         if let Some(obj) = response.as_object() {
@@ -336,58 +356,79 @@ impl Lsp {
     fn absolute(&self, file_path: &str) -> PathBuf {
         normalize(&self.root.join(file_path))
     }
+}
 
-    fn relative(&self, uri: &str) -> String {
-        let path = uri_to_path(uri);
-        path.strip_prefix(&self.root)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| path.to_string_lossy().into_owned())
+/// The path of a file URI relative to `root`, or absolute if outside it.
+fn relative(root: &Path, uri: &str) -> String {
+    let path = uri_to_path(uri);
+    path.strip_prefix(root)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string_lossy().into_owned())
+}
+
+/// `file:line:character` with one-based line and character.
+fn display_location(root: &Path, location: &Location) -> String {
+    format!(
+        "{}:{}:{}",
+        relative(root, &location.uri),
+        location.line + 1,
+        location.character + 1
+    )
+}
+
+/// Lists every location, grouped by file in the order the server
+/// returned them.
+fn format_references(root: &Path, locations: &[Location]) -> String {
+    if locations.is_empty() {
+        return "No references found.".to_string();
     }
 
-    /// Lists every location, grouped by file in the order the server
-    /// returned them.
-    fn format_references(&self, locations: &[Location]) -> String {
-        if locations.is_empty() {
-            return "No references found.".to_string();
+    let mut files: Vec<(String, Vec<&Location>)> = Vec::new();
+    for location in locations {
+        let file = relative(root, &location.uri);
+        match files.iter_mut().find(|(f, _)| *f == file) {
+            Some((_, group)) => group.push(location),
+            None => files.push((file, vec![location])),
         }
-
-        let mut files: Vec<(String, Vec<&Location>)> = Vec::new();
-        for location in locations {
-            let file = self.relative(&location.uri);
-            match files.iter_mut().find(|(f, _)| *f == file) {
-                Some((_, group)) => group.push(location),
-                None => files.push((file, vec![location])),
-            }
-        }
-
-        let mut out = format!(
-            "Found {} reference{} across {} file{}:\n",
-            locations.len(),
-            if locations.len() == 1 { "" } else { "s" },
-            files.len(),
-            if files.len() == 1 { "" } else { "s" },
-        );
-        for (file, group) in files {
-            out.push_str(&format!("\n{}:\n", file));
-            for location in group {
-                out.push_str(&format!(
-                    "  Line {}:{}\n",
-                    location.line + 1,
-                    location.character + 1
-                ));
-            }
-        }
-        out.trim_end().to_string()
     }
 
-    fn display_location(&self, location: &Location) -> String {
-        format!(
-            "{}:{}:{}",
-            self.relative(&location.uri),
-            location.line + 1,
-            location.character + 1
-        )
+    let mut out = format!(
+        "Found {} reference{} across {} file{}:\n",
+        locations.len(),
+        if locations.len() == 1 { "" } else { "s" },
+        files.len(),
+        if files.len() == 1 { "" } else { "s" },
+    );
+    for (file, group) in files {
+        out.push_str(&format!("\n{}:\n", file));
+        for location in group {
+            out.push_str(&format!(
+                "  Line {}:{}\n",
+                location.line + 1,
+                location.character + 1
+            ));
+        }
     }
+    out.trim_end().to_string()
+}
+
+/// The `<new-diagnostics>` block appended to a tool result, with
+/// relative paths and one-based positions.
+fn format_diagnostics(root: &Path, files: &[(String, Vec<Diagnostic>)]) -> String {
+    let sections: Vec<String> = files
+        .iter()
+        .map(|(uri, issues)| {
+            let lines: Vec<String> = issues
+                .iter()
+                .map(|d| format!("  [Line {}:{}] {}", d.line + 1, d.character + 1, d.message))
+                .collect();
+            format!("{}:\n{}", relative(root, uri), lines.join("\n"))
+        })
+        .collect();
+    format!(
+        "<new-diagnostics>The following new diagnostic issues were detected:\n\n{}</new-diagnostics>",
+        sections.join("\n\n")
+    )
 }
 
 fn one_based(value: &Value) -> Option<u64> {

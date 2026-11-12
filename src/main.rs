@@ -317,7 +317,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         client: Client::with_config(config),
         skills: skills::discover(),
         tools,
-        lsp: lsp.map(Lsp::new),
+        lsp: lsp.map(|client| Lsp::new(client, env::current_dir().unwrap_or_default())),
     };
 
     let mut system_prompt = Vec::new();
