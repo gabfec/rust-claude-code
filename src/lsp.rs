@@ -82,6 +82,48 @@ impl Lsp {
         }
     }
 
+    /// Brings the server's copy of a just-written file up to date:
+    /// `didChange` with the next version if the document is open,
+    /// otherwise `didOpen` at version 1. Files outside the client's
+    /// language mapping are ignored.
+    pub fn sync_write(&self, file_path: &str, text: &str) -> Result<(), Box<dyn Error>> {
+        let path = self.absolute(file_path);
+        let Some(language_id) = self.mapped_language(&path) else {
+            return Ok(());
+        };
+        let uri = path_to_uri(&path);
+        let current = self.versions.lock().unwrap().get(&uri).copied();
+
+        let version = match current {
+            Some(version) => {
+                self.notify(
+                    "textDocument/didChange",
+                    json!({
+                        "textDocument": { "uri": uri, "version": version + 1 },
+                        "contentChanges": [{ "text": text }]
+                    }),
+                )?;
+                version + 1
+            }
+            None => {
+                self.notify(
+                    "textDocument/didOpen",
+                    json!({
+                        "textDocument": {
+                            "uri": uri,
+                            "languageId": language_id,
+                            "version": 1,
+                            "text": text
+                        }
+                    }),
+                )?;
+                1
+            }
+        };
+        self.versions.lock().unwrap().insert(uri, version);
+        Ok(())
+    }
+
     /// Sends `didOpen` for a document the server hasn't seen yet and
     /// returns its URI.
     fn ensure_open(&self, path: &Path) -> Result<String, Box<dyn Error>> {
@@ -106,11 +148,15 @@ impl Lsp {
         Ok(uri)
     }
 
-    fn language_id(&self, path: &Path) -> String {
+    fn mapped_language(&self, path: &Path) -> Option<String> {
         path.extension()
             .and_then(|e| e.to_str())
             .and_then(|e| self.client.extension_to_language.get(&format!(".{e}")))
             .cloned()
+    }
+
+    fn language_id(&self, path: &Path) -> String {
+        self.mapped_language(path)
             .unwrap_or_else(|| "plaintext".to_string())
     }
 

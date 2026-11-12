@@ -13,6 +13,11 @@ use skills::Skill;
 
 const MODEL: &str = "anthropic/claude-haiku-4.5";
 
+const LSP_SYSTEM_PROMPT: &str = "A language server is connected. Use the LSP tool \
+to find where a symbol is defined (goToDefinition) or everything that references it \
+(findReferences); its line and character inputs are 1-based. Make every file edit \
+with the Write tool so the language server sees the updated code.";
+
 #[derive(Parser)]
 #[command(author, version, about)]
 struct Args {
@@ -78,8 +83,17 @@ impl Agent {
             "Write" => {
                 let file_path = arguments["file_path"].as_str().unwrap_or("");
                 let content = arguments["content"].as_str().unwrap_or("");
-                let _ = fs::write(file_path, content);
-                content.to_string()
+                match fs::write(file_path, content) {
+                    Ok(()) => {
+                        if let Some(lsp) = &self.lsp {
+                            if let Err(e) = lsp.sync_write(file_path, content) {
+                                eprintln!("LSP sync failed for {}: {}", file_path, e);
+                            }
+                        }
+                        content.to_string()
+                    }
+                    Err(e) => format!("Error: {}", e),
+                }
             }
             "Bash" => {
                 let command = arguments["command"].as_str().unwrap_or("");
@@ -190,7 +204,7 @@ fn tool_definitions() -> Value {
             "type": "function",
             "function": {
                 "name": "Write",
-                "description": "Write content to a file",
+                "description": "Write content to a file, replacing it. Use this for every file edit so the language server sees the change.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -278,11 +292,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
         lsp: lsp.map(Lsp::new),
     };
 
-    let mut messages = Vec::new();
+    let mut system_prompt = Vec::new();
     if !agent.skills.is_empty() {
+        system_prompt.push(skills::system_prompt(&agent.skills));
+    }
+    if agent.lsp.is_some() {
+        system_prompt.push(LSP_SYSTEM_PROMPT.to_string());
+    }
+
+    let mut messages = Vec::new();
+    if !system_prompt.is_empty() {
         messages.push(json!({
             "role": "system",
-            "content": skills::system_prompt(&agent.skills)
+            "content": system_prompt.join("\n")
         }));
     }
     let mut user_contents = skills::expand_prompt(&agent.skills, &args.prompt);
