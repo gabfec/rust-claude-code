@@ -44,15 +44,33 @@ pub fn discover() -> Vec<Skill> {
     dirs.iter().filter_map(|d| Skill::load(d)).collect()
 }
 
-/// Expands a `/name args...` prompt into the invoked skill's body,
-/// with the argument placeholders substituted. Returns `None` when the
-/// prompt doesn't start with a known skill name.
-pub fn expand_prompt(skills: &[Skill], prompt: &str) -> Option<String> {
-    let prompt = prompt.trim_start();
-    let (first, rest) = prompt.split_once(char::is_whitespace).unwrap_or((prompt, ""));
-    let name = first.strip_prefix('/')?;
-    let skill = skills.iter().find(|s| s.name == name)?;
-    Some(substitute_arguments(&skill.body, rest.trim()))
+/// Expands the leading `/name` tokens of a prompt into skill bodies.
+///
+/// Every leading token that names a known skill is expanded; the first
+/// token that doesn't ends the run, and it and everything after it
+/// become the argument text for each expanded body. Returns an empty
+/// list when the prompt doesn't start with a known skill name.
+pub fn expand_prompt(skills: &[Skill], prompt: &str) -> Vec<String> {
+    let mut invoked = Vec::new();
+    let mut rest = prompt.trim_start();
+
+    loop {
+        let (token, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        let Some(skill) = token
+            .strip_prefix('/')
+            .and_then(|name| skills.iter().find(|s| s.name == name))
+        else {
+            break;
+        };
+        invoked.push(skill);
+        rest = tail.trim_start();
+    }
+
+    let arguments = rest.trim_end();
+    invoked
+        .iter()
+        .map(|skill| substitute_arguments(&skill.body, arguments))
+        .collect()
 }
 
 /// Replaces `$ARGUMENTS`, `$ARGUMENTS[N]` and `$N` in a skill body.
@@ -212,6 +230,20 @@ mod tests {
     fn missing_arguments_become_empty() {
         assert_eq!(substitute_arguments("[$ARGUMENTS][$0][$ARGUMENTS[3]]", ""), "[][][]");
         assert_eq!(substitute_arguments("costs $ 5", "x"), "costs $ 5");
+    }
+
+    fn skill(name: &str, body: &str) -> Skill {
+        Skill { name: name.into(), description: String::new(), body: body.into() }
+    }
+
+    #[test]
+    fn stacks_leading_skills() {
+        let skills = [skill("apple", "a-$ARGUMENTS"), skill("grape", "g-$ARGUMENTS")];
+        assert_eq!(expand_prompt(&skills, "/apple /grape 4127"), ["a-4127", "g-4127"]);
+        assert_eq!(expand_prompt(&skills, "/apple 4127 /grape"), ["a-4127 /grape"]);
+        assert_eq!(expand_prompt(&skills, "/apple /pear 4127"), ["a-/pear 4127"]);
+        assert_eq!(expand_prompt(&skills, "/grape"), ["g-"]);
+        assert!(expand_prompt(&skills, "hello /apple").is_empty());
     }
 
     #[test]
