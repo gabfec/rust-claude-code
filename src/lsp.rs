@@ -515,6 +515,326 @@ pub fn uri_to_path(uri: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Records every call, answers requests from a queue of canned
+    /// results, and serves a notification queue with a cursor.
+    #[derive(Clone, Default)]
+    struct FakeTransport {
+        calls: Arc<Mutex<Vec<(String, Value)>>>,
+        results: Arc<Mutex<VecDeque<Value>>>,
+        notifications: Arc<Mutex<Vec<Value>>>,
+        languages: HashMap<String, String>,
+    }
+
+    impl Transport for FakeTransport {
+        fn call(&self, action: &str, payload: &Value) -> Result<Value, Box<dyn Error>> {
+            self.calls.lock().unwrap().push((action.to_string(), payload.clone()));
+            match action {
+                "request" => Ok(self.results.lock().unwrap().pop_front().unwrap_or(Value::Null)),
+                "notifications" => {
+                    let queue = self.notifications.lock().unwrap();
+                    let after = (payload["after"].as_u64().unwrap() as usize).min(queue.len());
+                    Ok(json!({ "cursor": queue.len(), "notifications": queue[after..] }))
+                }
+                _ => Ok(json!({})),
+            }
+        }
+
+        fn extension_to_language(&self) -> &HashMap<String, String> {
+            &self.languages
+        }
+    }
+
+    impl FakeTransport {
+        /// `(method, params)` of every notify and request, in order.
+        fn sent(&self) -> Vec<(String, Value)> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(action, _)| action == "notify" || action == "request")
+                .map(|(_, p)| (p["method"].as_str().unwrap().to_string(), p["params"].clone()))
+                .collect()
+        }
+
+        fn methods(&self) -> Vec<String> {
+            self.sent().into_iter().map(|(m, _)| m).collect()
+        }
+
+        fn publish(&self, uri: &str, version: Option<i64>, issues: &[(u64, u64, &str)]) {
+            let diagnostics: Vec<Value> = issues
+                .iter()
+                .map(|(line, character, message)| {
+                    json!({
+                        "range": {
+                            "start": { "line": line, "character": character },
+                            "end": { "line": line, "character": character + 1 }
+                        },
+                        "severity": 1,
+                        "message": message
+                    })
+                })
+                .collect();
+            let mut params = json!({ "uri": uri, "diagnostics": diagnostics });
+            if let Some(version) = version {
+                params["version"] = json!(version);
+            }
+            self.notifications.lock().unwrap().push(json!({
+                "method": "textDocument/publishDiagnostics",
+                "params": params
+            }));
+        }
+    }
+
+    const CHECKOUT: &str = "from pricing import total as invoice_total\n\n\ndef checkout_total() -> int:\n    return invoice_total(250, 2)\n";
+    const PRICING: &str = "def total(price: int, quantity: int) -> int:\n    return price * quantity\n";
+
+    /// A temporary project folder, removed when dropped.
+    struct Project(PathBuf);
+
+    impl std::ops::Deref for Project {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Project {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// An `Lsp` over a fake transport, rooted in a fresh project folder
+    /// holding checkout.py, pricing.py and notes.txt.
+    fn setup() -> (Lsp, FakeTransport, Project) {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "lsp-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("checkout.py"), CHECKOUT).unwrap();
+        fs::write(root.join("pricing.py"), PRICING).unwrap();
+        fs::write(root.join("notes.txt"), "notes").unwrap();
+
+        let fake = FakeTransport {
+            languages: HashMap::from([(".py".to_string(), "python".to_string())]),
+            ..Default::default()
+        };
+        (Lsp::new(fake.clone(), root.clone()), fake, Project(root))
+    }
+
+    fn uri(root: &Path, file: &str) -> String {
+        path_to_uri(&root.join(file))
+    }
+
+    fn location(root: &Path, file: &str, line: u64, character: u64) -> Value {
+        json!({
+            "uri": uri(root, file),
+            "range": {
+                "start": { "line": line, "character": character },
+                "end": { "line": line, "character": character + 5 }
+            }
+        })
+    }
+
+    fn lookup(operation: &str, file: &str, line: u64, character: u64) -> Value {
+        json!({ "operation": operation, "filePath": file, "line": line, "character": character })
+    }
+
+    #[test]
+    fn definition_opens_the_document_once_and_converts_positions() {
+        let (lsp, fake, root) = setup();
+        fake.results.lock().unwrap().extend([
+            location(&root, "pricing.py", 0, 4),
+            location(&root, "pricing.py", 0, 4),
+        ]);
+
+        let first = lsp.execute(&lookup("goToDefinition", "checkout.py", 5, 12));
+        let second = lsp.execute(&lookup("goToDefinition", "./checkout.py", 5, 12));
+        assert_eq!(first, "Defined in pricing.py:1:5");
+        assert_eq!(second, first);
+
+        let sent = fake.sent();
+        assert_eq!(
+            fake.methods(),
+            ["textDocument/didOpen", "textDocument/definition", "textDocument/definition"]
+        );
+        assert_eq!(
+            sent[0].1["textDocument"],
+            json!({
+                "uri": uri(&root, "checkout.py"),
+                "languageId": "python",
+                "version": 1,
+                "text": CHECKOUT
+            })
+        );
+        for (_, params) in &sent[1..] {
+            assert_eq!(params["textDocument"]["uri"], uri(&root, "checkout.py"));
+            assert_eq!(params["position"], json!({ "line": 4, "character": 11 }));
+        }
+    }
+
+    #[test]
+    fn references_are_listed_by_file_with_one_based_positions() {
+        let (lsp, fake, root) = setup();
+        fake.results.lock().unwrap().extend([
+            json!([
+                location(&root, "pricing.py", 0, 4),
+                location(&root, "reports.py", 4, 11),
+                location(&root, "reports.py", 4, 27),
+            ]),
+            json!([]),
+        ]);
+
+        assert_eq!(
+            lsp.execute(&lookup("findReferences", "pricing.py", 1, 5)),
+            "Found 3 references across 2 files:\n\n\
+             pricing.py:\n  Line 1:5\n\n\
+             reports.py:\n  Line 5:12\n  Line 5:28"
+        );
+        assert_eq!(
+            lsp.execute(&lookup("findReferences", "pricing.py", 1, 5)),
+            "No references found."
+        );
+
+        let (method, params) = &fake.sent()[1];
+        assert_eq!(method, "textDocument/references");
+        assert_eq!(params["position"], json!({ "line": 0, "character": 4 }));
+        assert_eq!(params["context"], json!({ "includeDeclaration": true }));
+    }
+
+    #[test]
+    fn writes_open_or_change_the_document_with_increasing_versions() {
+        let (lsp, fake, root) = setup();
+
+        lsp.sync_write("checkout.py", "v1").unwrap();
+        lsp.sync_write("./checkout.py", "v2").unwrap();
+        lsp.sync_write("checkout.py", "v3\n").unwrap();
+        lsp.sync_write("notes.txt", "not a mapped language").unwrap();
+
+        let sent = fake.sent();
+        assert_eq!(
+            fake.methods(),
+            ["textDocument/didOpen", "textDocument/didChange", "textDocument/didChange"]
+        );
+        assert_eq!(sent[0].1["textDocument"]["version"], 1);
+        assert_eq!(sent[0].1["textDocument"]["text"], "v1");
+        assert_eq!(
+            sent[2].1,
+            json!({
+                "textDocument": { "uri": uri(&root, "checkout.py"), "version": 3 },
+                "contentChanges": [{ "text": "v3\n" }]
+            })
+        );
+    }
+
+    #[test]
+    fn writes_continue_the_version_of_a_document_opened_by_navigation() {
+        let (lsp, fake, _root) = setup();
+        lsp.execute(&lookup("goToDefinition", "pricing.py", 1, 5));
+        lsp.sync_write("pricing.py", PRICING).unwrap();
+
+        let sent = fake.sent();
+        assert_eq!(sent[2].0, "textDocument/didChange");
+        assert_eq!(sent[2].1["textDocument"]["version"], 2);
+    }
+
+    #[test]
+    fn diagnostics_skip_stale_reports_and_repeat_nothing() {
+        let a = "file:///p/a.py".to_string();
+        let b = "file:///p/b.py".to_string();
+        let versions = HashMap::from([(a.clone(), 2)]);
+        let report = |uri: &str, version: Option<i64>, issues: &[&str]| {
+            let fake = FakeTransport::default();
+            let issues: Vec<(u64, u64, &str)> = issues.iter().map(|m| (0, 0, *m)).collect();
+            fake.publish(uri, version, &issues);
+            fake.notifications.lock().unwrap().pop().unwrap()
+        };
+        let mut diagnostics = Diagnostics::default();
+
+        // A report for an older version is ignored; current and
+        // unversioned ones are accepted.
+        diagnostics.ingest(
+            &[
+                report(&a, Some(1), &["stale"]),
+                report(&a, Some(2), &["current"]),
+                report(&b, None, &["unversioned"]),
+            ],
+            &versions,
+        );
+        let taken = diagnostics.take();
+        let messages: Vec<&str> = taken
+            .iter()
+            .flat_map(|(_, issues)| issues.iter().map(|d| d.message.as_str()))
+            .collect();
+        assert_eq!(messages, ["current", "unversioned"]);
+
+        // The same issues again are not new.
+        diagnostics.ingest(&[report(&a, Some(2), &["current"])], &versions);
+        assert!(diagnostics.take().is_empty());
+
+        // Clearing a file and reporting the issue again shows it again.
+        diagnostics.ingest(&[report(&a, Some(2), &[])], &versions);
+        diagnostics.ingest(&[report(&a, Some(2), &["current"])], &versions);
+        assert_eq!(diagnostics.take().len(), 1);
+
+        // An issue cleared before the model saw it is still delivered.
+        diagnostics.ingest(
+            &[report(&a, Some(2), &["brief"]), report(&a, Some(2), &[])],
+            &versions,
+        );
+        assert_eq!(diagnostics.take()[0].1[0].message, "brief");
+    }
+
+    #[test]
+    fn reports_queued_before_a_write_are_judged_by_their_own_version() {
+        let (lsp, fake, root) = setup();
+        lsp.execute(&lookup("goToDefinition", "checkout.py", 5, 12));
+
+        // Published for version 1 while the model was busy, then the
+        // model rewrites checkout.py, moving it to version 2.
+        fake.publish(
+            &uri(&root, "checkout.py"),
+            Some(1),
+            &[(4, 11, "Type Price is not assignable to return type int")],
+        );
+        lsp.sync_write("checkout.py", CHECKOUT).unwrap();
+        lsp.poll_diagnostics().unwrap();
+
+        assert_eq!(
+            lsp.take_new_diagnostics().unwrap(),
+            "<new-diagnostics>The following new diagnostic issues were detected:\n\n\
+             checkout.py:\n  [Line 5:12] Type Price is not assignable to return type int\
+             </new-diagnostics>"
+        );
+        assert_eq!(lsp.take_new_diagnostics(), None);
+
+        // The Write settled the queue first, reading with a wait until a
+        // read came back empty; each read continues from the previous
+        // cursor, and the plain poll afterwards doesn't wait.
+        let reads: Vec<(Value, Value)> = fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(action, _)| action == "notifications")
+            .map(|(_, p)| (p["after"].clone(), p["timeoutMs"].clone()))
+            .collect();
+        assert_eq!(
+            reads,
+            [
+                (json!(0), json!(SETTLE_WAIT_MS)),
+                (json!(1), json!(SETTLE_WAIT_MS)),
+                (json!(1), json!(0)),
+            ]
+        );
+    }
 
     #[test]
     fn uris_round_trip_with_special_characters() {
