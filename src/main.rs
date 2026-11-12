@@ -1,9 +1,13 @@
 use async_openai::{Client, config::OpenAIConfig};
 use clap::Parser;
 use serde_json::{Value, json};
-use std::{env, fs, process::{self, Command}};
+use std::{env, error::Error, fs, process::{self, Command}};
 
 mod skills;
+
+use skills::Skill;
+
+const MODEL: &str = "anthropic/claude-haiku-4.5";
 
 #[derive(Parser)]
 #[command(author, version, about)]
@@ -12,45 +16,116 @@ struct Args {
     prompt: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+struct Agent {
+    client: Client<OpenAIConfig>,
+    skills: Vec<Skill>,
+    tools: Value,
+}
 
-    let base_url = env::var("OPENROUTER_BASE_URL")
-        .unwrap_or_else(|_| "https://openrouter.ai/api/v1".to_string());
+impl Agent {
+    /// Runs the agent loop over `messages` with the given tools until
+    /// the model answers without calling a tool, and returns that answer.
+    async fn run(&self, messages: &mut Vec<Value>, tools: &Value) -> Result<String, Box<dyn Error>> {
+        loop {
+            let response: Value = self
+                .client
+                .chat()
+                .create_byot(json!({
+                    "messages": messages,
+                    "model": MODEL,
+                    "tools": tools
+                }))
+                .await?;
 
-    let api_key = env::var("OPENROUTER_API_KEY").unwrap_or_else(|_| {
-        eprintln!("OPENROUTER_API_KEY is not set");
-        process::exit(1);
-    });
+            let message = &response["choices"][0]["message"];
 
-    let config = OpenAIConfig::new()
-        .with_api_base(base_url)
-        .with_api_key(api_key);
+            // Add the assistant's message to history
+            messages.push(message.clone());
 
-    let client = Client::with_config(config);
+            let Some(tool_calls) = message["tool_calls"].as_array() else {
+                return Ok(message["content"].as_str().unwrap_or("").to_string());
+            };
 
-    let skills = skills::discover();
+            for tool_call in tool_calls {
+                let tool_id = tool_call["id"].as_str().unwrap_or("");
+                let function_name = tool_call["function"]["name"].as_str().unwrap_or("");
+                let arguments_str = tool_call["function"]["arguments"].as_str().unwrap_or("{}");
+                let content = match serde_json::from_str::<Value>(arguments_str) {
+                    Ok(arguments) => self.execute_tool(function_name, &arguments).await?,
+                    Err(e) => format!("Error: invalid tool arguments: {}", e),
+                };
 
-    let mut messages = Vec::new();
-    if !skills.is_empty() {
-        messages.push(json!({
-            "role": "system",
-            "content": skills::system_prompt(&skills)
-        }));
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": tool_id,
+                    "content": content
+                }));
+            }
+        }
     }
-    let mut user_contents = skills::expand_prompt(&skills, &args.prompt);
-    if user_contents.is_empty() {
-        user_contents.push(args.prompt);
+
+    async fn execute_tool(&self, name: &str, arguments: &Value) -> Result<String, Box<dyn Error>> {
+        let content = match name {
+            "Read" => {
+                let file_path = arguments["file_path"].as_str().unwrap_or("");
+                fs::read_to_string(file_path).unwrap_or_else(|e| format!("Error: {}", e))
+            }
+            "Write" => {
+                let file_path = arguments["file_path"].as_str().unwrap_or("");
+                let content = arguments["content"].as_str().unwrap_or("");
+                let _ = fs::write(file_path, content);
+                content.to_string()
+            }
+            "Bash" => {
+                let command = arguments["command"].as_str().unwrap_or("");
+                let output = Command::new("sh").arg("-c").arg(command).output()?;
+                String::from_utf8_lossy(&output.stdout).to_string()
+            }
+            "Skill" => {
+                let name = arguments["name"].as_str().unwrap_or("");
+                let skill_args = arguments["args"].as_str().unwrap_or("");
+                match self.skills.iter().find(|s| s.name == name) {
+                    Some(skill) if skill.fork => self.run_subagent(skill, skill_args).await?,
+                    Some(skill) => skill.instructions(skill_args),
+                    None => format!("Error: unknown skill `{}`", name),
+                }
+            }
+            _ => {
+                eprintln!("Unknown function: {}", name);
+                format!("Error: unknown tool `{}`", name)
+            }
+        };
+        Ok(content)
     }
-    for content in user_contents {
-        messages.push(json!({
+
+    /// Runs a `context: fork` skill in a fresh conversation holding only
+    /// its body, and reports the subagent's answer.
+    ///
+    /// The subagent gets every tool except Skill: it is there to carry
+    /// out one skill, and letting it invoke skills could fork forever.
+    async fn run_subagent(&self, skill: &Skill, arguments: &str) -> Result<String, Box<dyn Error>> {
+        let mut messages = vec![json!({
             "role": "user",
-            "content": content
-        }));
+            "content": skills::substitute_arguments(&skill.body, arguments)
+        })];
+        let tools: Vec<Value> = self
+            .tools
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|t| t["function"]["name"] != "Skill")
+            .cloned()
+            .collect();
+        let answer = Box::pin(self.run(&mut messages, &json!(tools))).await?;
+        Ok(format!(
+            "Skill {} ran in a separate context and returned: {}",
+            skill.name, answer
+        ))
     }
+}
 
-    let tools = json!([
+fn tool_definitions() -> Value {
+    json!([
         {
             "type": "function",
             "function": {
@@ -127,98 +202,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-    ]);
+    ])
+}
 
-    loop {
-        let response: Value = client
-            .chat()
-            .create_byot(json!({
-                "messages": messages,
-                "model": "anthropic/claude-haiku-4.5",
-                "tools": tools
-            }))
-            .await?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let args = Args::parse();
 
-        let choice = &response["choices"][0];
-        let message = &choice["message"];
+    let base_url = env::var("OPENROUTER_BASE_URL")
+        .unwrap_or_else(|_| "https://openrouter.ai/api/v1".to_string());
 
-        // Add the assistant's message to history
-        messages.push(message.clone());
+    let api_key = env::var("OPENROUTER_API_KEY").unwrap_or_else(|_| {
+        eprintln!("OPENROUTER_API_KEY is not set");
+        process::exit(1);
+    });
 
-        // If there are tool calls
-        if let Some(tool_calls) = message["tool_calls"].as_array() {
-            for tool_call in tool_calls {
-                let tool_id = tool_call["id"].as_str().unwrap();
-                let function_name = tool_call["function"]["name"].as_str().unwrap();
-                let arguments_str = tool_call["function"]["arguments"].as_str().unwrap();
-                let arguments: Value = serde_json::from_str(arguments_str)?;
+    let config = OpenAIConfig::new()
+        .with_api_base(base_url)
+        .with_api_key(api_key);
 
-                match function_name {
-                    "Read" => {
-                        let file_path = arguments["file_path"].as_str().unwrap();
-                        let contents = fs::read_to_string(file_path)
-                            .unwrap_or_else(|e| format!("Error: {}", e));
+    let agent = Agent {
+        client: Client::with_config(config),
+        skills: skills::discover(),
+        tools: tool_definitions(),
+    };
 
-                        messages.push(json!({
-                                "role": "tool",
-                                "tool_call_id": tool_id,
-                                "content": contents
-                        }));
-                    }
-                    "Write" => {
-                        let file_path = arguments["file_path"].as_str().unwrap();
-                        let content = arguments["content"].as_str().unwrap();
-                        let _ = fs::write(file_path, content);
-                        messages.push(json!({
-                                "role": "tool",
-                                "tool_call_id": tool_id,
-                                "content": content
-                        }));
-                    }
-                    "Bash" => {
-                        let command = arguments["command"].as_str().unwrap();
-                        let output = Command::new("sh").arg("-c").arg(command).output()?;
-                        let content = String::from_utf8_lossy(&output.stdout).to_string();
-                        messages.push(json!({
-                                "role": "tool",
-                                "tool_call_id": tool_id,
-                                "content": content
-                        }));
-                    }
-                    "Skill" => {
-                        let name = arguments["name"].as_str().unwrap_or("");
-                        let skill_args = arguments["args"].as_str().unwrap_or("");
-                        let content = match skills.iter().find(|s| s.name == name) {
-                            Some(skill) => skill.instructions(skill_args),
-                            None => format!("Error: unknown skill `{}`", name),
-                        };
-                        messages.push(json!({
-                                "role": "tool",
-                                "tool_call_id": tool_id,
-                                "content": content
-                        }));
-                    }
-                    _ => {
-                        eprintln!("Unknown function: {}", function_name);
-                        messages.push(json!({
-                                "role": "tool",
-                                "tool_call_id": tool_id,
-                                "content": format!("Error: unknown tool `{}`", function_name)
-                        }));
-                    }
-                }
-            }
-
-            continue;
-        }
-
-        // No more tool calls
-        if let Some(content) = message["content"].as_str() {
-            print!("{}", content);
-        }
-
-        break;
+    let mut messages = Vec::new();
+    if !agent.skills.is_empty() {
+        messages.push(json!({
+            "role": "system",
+            "content": skills::system_prompt(&agent.skills)
+        }));
     }
+    let mut user_contents = skills::expand_prompt(&agent.skills, &args.prompt);
+    if user_contents.is_empty() {
+        user_contents.push(args.prompt);
+    }
+    for content in user_contents {
+        messages.push(json!({
+            "role": "user",
+            "content": content
+        }));
+    }
+
+    let answer = agent.run(&mut messages, &agent.tools).await?;
+    print!("{}", answer);
 
     Ok(())
 }

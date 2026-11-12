@@ -11,6 +11,8 @@ pub struct Skill {
     pub body: String,
     /// Project-relative folder holding SKILL.md and bundled files.
     pub dir: String,
+    /// `context: fork` — run the skill in a subagent.
+    pub fork: bool,
 }
 
 impl Skill {
@@ -27,6 +29,7 @@ impl Skill {
             name: folder_name,
             description: fields.get("description").cloned().unwrap_or_default(),
             body: body.trim().to_string(),
+            fork: fields.get("context").is_some_and(|c| c == "fork"),
         })
     }
 
@@ -92,8 +95,15 @@ pub fn expand_prompt(skills: &[Skill], prompt: &str) -> Vec<String> {
         else {
             break;
         };
+        // A skill that asks for a subagent is never stacked with others.
+        if skill.fork && !invoked.is_empty() {
+            break;
+        }
         invoked.push(skill);
         rest = tail.trim_start();
+        if skill.fork {
+            break;
+        }
     }
 
     let arguments = rest.trim_end();
@@ -272,6 +282,7 @@ mod tests {
             description: String::new(),
             body: body.into(),
             dir: format!("{SKILLS_DIR}/{name}"),
+            fork: false,
         }
     }
 
