@@ -9,6 +9,8 @@ pub struct Skill {
     pub name: String,
     pub description: String,
     pub body: String,
+    /// Project-relative folder holding SKILL.md and bundled files.
+    pub dir: String,
 }
 
 impl Skill {
@@ -21,9 +23,37 @@ impl Skill {
         Some(Skill {
             // Skills are invoked by folder name, which the standard
             // requires to match the frontmatter name.
+            dir: format!("{SKILLS_DIR}/{folder_name}"),
             name: folder_name,
             description: fields.get("description").cloned().unwrap_or_default(),
             body: body.trim().to_string(),
+        })
+    }
+
+    /// The body with arguments substituted. When the skill bundles
+    /// files next to SKILL.md, the body is prefixed with the skill's
+    /// location so the model can resolve paths relative to it.
+    ///
+    /// Plain skills get the bare body: the header adds nothing for them,
+    /// and above a terse instruction the model can mistake it for an
+    /// injection attempt and refuse.
+    pub fn instructions(&self, arguments: &str) -> String {
+        let body = substitute_arguments(&self.body, arguments);
+        if !self.has_bundled_files() {
+            return body;
+        }
+        format!(
+            "Skill: {} (located at {})\n\
+             Paths in the instructions below are relative to that folder.\n\n{}",
+            self.name, self.dir, body
+        )
+    }
+
+    fn has_bundled_files(&self) -> bool {
+        fs::read_dir(&self.dir).is_ok_and(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .any(|e| e.file_name() != "SKILL.md")
         })
     }
 }
@@ -69,7 +99,7 @@ pub fn expand_prompt(skills: &[Skill], prompt: &str) -> Vec<String> {
     let arguments = rest.trim_end();
     invoked
         .iter()
-        .map(|skill| substitute_arguments(&skill.body, arguments))
+        .map(|skill| skill.instructions(arguments))
         .collect()
 }
 
@@ -233,17 +263,51 @@ mod tests {
     }
 
     fn skill(name: &str, body: &str) -> Skill {
-        Skill { name: name.into(), description: String::new(), body: body.into() }
+        Skill {
+            name: name.into(),
+            description: String::new(),
+            body: body.into(),
+            dir: format!("{SKILLS_DIR}/{name}"),
+        }
     }
 
     #[test]
     fn stacks_leading_skills() {
         let skills = [skill("apple", "a-$ARGUMENTS"), skill("grape", "g-$ARGUMENTS")];
-        assert_eq!(expand_prompt(&skills, "/apple /grape 4127"), ["a-4127", "g-4127"]);
-        assert_eq!(expand_prompt(&skills, "/apple 4127 /grape"), ["a-4127 /grape"]);
-        assert_eq!(expand_prompt(&skills, "/apple /pear 4127"), ["a-/pear 4127"]);
-        assert_eq!(expand_prompt(&skills, "/grape"), ["g-"]);
+        let bodies = |prompt| -> Vec<String> {
+            expand_prompt(&skills, prompt)
+                .iter()
+                .map(|m| m.rsplit("\n\n").next().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(bodies("/apple /grape 4127"), ["a-4127", "g-4127"]);
+        assert_eq!(bodies("/apple 4127 /grape"), ["a-4127 /grape"]);
+        assert_eq!(bodies("/apple /pear 4127"), ["a-/pear 4127"]);
+        assert_eq!(bodies("/grape"), ["g-"]);
         assert!(expand_prompt(&skills, "hello /apple").is_empty());
+    }
+
+    #[test]
+    fn instructions_name_the_folder_only_with_bundled_files() {
+        let dir = std::env::temp_dir().join(format!("skill-test-{}", std::process::id()));
+        fs::create_dir_all(dir.join("scripts")).unwrap();
+        fs::write(dir.join("SKILL.md"), "---\nname: apple\n---\n").unwrap();
+
+        let mut apple = skill("apple", "Run `scripts/x.sh`.");
+        apple.dir = dir.to_string_lossy().into_owned();
+        assert_eq!(
+            apple.instructions(""),
+            format!(
+                "Skill: apple (located at {})\n\
+                 Paths in the instructions below are relative to that folder.\n\n\
+                 Run `scripts/x.sh`.",
+                apple.dir
+            )
+        );
+
+        fs::remove_dir_all(dir.join("scripts")).unwrap();
+        assert_eq!(apple.instructions(""), "Run `scripts/x.sh`.");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
