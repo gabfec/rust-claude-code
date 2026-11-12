@@ -3,8 +3,10 @@ use clap::Parser;
 use serde_json::{Value, json};
 use std::{env, error::Error, fs, process::{self, Command}};
 
+mod lsp_client;
 mod skills;
 
+use lsp_client::LspClient;
 use skills::Skill;
 
 const MODEL: &str = "anthropic/claude-haiku-4.5";
@@ -20,6 +22,7 @@ struct Agent {
     client: Client<OpenAIConfig>,
     skills: Vec<Skill>,
     tools: Value,
+    lsp: Option<LspClient>,
 }
 
 impl Agent {
@@ -81,6 +84,7 @@ impl Agent {
                 let output = Command::new("sh").arg("-c").arg(command).output()?;
                 String::from_utf8_lossy(&output.stdout).to_string()
             }
+            "LSP" if self.lsp.is_some() => "LSP is not implemented yet".to_string(),
             "Skill" => {
                 let name = arguments["name"].as_str().unwrap_or("");
                 let skill_args = arguments["args"].as_str().unwrap_or("");
@@ -122,6 +126,40 @@ impl Agent {
             skill.name, answer
         ))
     }
+}
+
+fn lsp_tool_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "LSP",
+            "description": "Ask the language server about code. goToDefinition returns the file, line, and character where the symbol at the given position is defined. Line and character are 1-based, as shown in an editor.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": ["goToDefinition"]
+                    },
+                    "filePath": {
+                        "type": "string",
+                        "description": "Absolute path, or a path relative to the agent's current working directory."
+                    },
+                    "line": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "1-based line number of the symbol."
+                    },
+                    "character": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "1-based character offset in UTF-16 code units (same as character count for ASCII)."
+                    }
+                },
+                "required": ["operation", "filePath", "line", "character"]
+            }
+        }
+    })
 }
 
 fn tool_definitions() -> Value {
@@ -221,10 +259,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_api_base(base_url)
         .with_api_key(api_key);
 
+    let lsp = LspClient::from_environment()?;
+    let mut tools = tool_definitions();
+    if lsp.is_some() {
+        eprintln!("LSP client connected");
+        tools.as_array_mut().unwrap().push(lsp_tool_definition());
+    }
+
     let agent = Agent {
         client: Client::with_config(config),
         skills: skills::discover(),
-        tools: tool_definitions(),
+        tools,
+        lsp,
     };
 
     let mut messages = Vec::new();
