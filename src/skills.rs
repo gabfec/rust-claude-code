@@ -1,0 +1,137 @@
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+pub const SKILLS_DIR: &str = ".claude/skills";
+
+#[derive(Debug, Clone)]
+pub struct Skill {
+    pub name: String,
+    pub description: String,
+    pub body: String,
+}
+
+impl Skill {
+    fn load(dir: &Path) -> Option<Self> {
+        let folder_name = dir.file_name()?.to_str()?.to_string();
+        let text = fs::read_to_string(dir.join("SKILL.md")).ok()?;
+        let (frontmatter, body) = split_frontmatter(&text);
+        let fields = parse_frontmatter(frontmatter);
+
+        Some(Skill {
+            // Skills are invoked by folder name, which the standard
+            // requires to match the frontmatter name.
+            name: folder_name,
+            description: fields.get("description").cloned().unwrap_or_default(),
+            body: body.trim().to_string(),
+        })
+    }
+}
+
+/// Finds every `.claude/skills/<name>/SKILL.md`, sorted by name.
+pub fn discover() -> Vec<Skill> {
+    let Ok(entries) = fs::read_dir(SKILLS_DIR) else {
+        return Vec::new();
+    };
+
+    let mut dirs: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+
+    dirs.iter().filter_map(|d| Skill::load(d)).collect()
+}
+
+pub fn system_prompt(skills: &[Skill]) -> String {
+    let mut prompt = String::from("You have access to the following skills:\n\n");
+    for skill in skills {
+        prompt.push_str(&format!("- {}: {}\n", skill.name, skill.description));
+    }
+    prompt
+}
+
+/// Splits a SKILL.md into its frontmatter (between the `---` markers)
+/// and its body. A file without frontmatter is all body.
+fn split_frontmatter(text: &str) -> (&str, &str) {
+    let mut lines = text.split_inclusive('\n');
+    match lines.next() {
+        Some(first) if first.trim_end() == "---" => {}
+        _ => return ("", text),
+    }
+
+    let start = text.find('\n').map(|i| i + 1).unwrap_or(text.len());
+    let mut offset = start;
+    for line in lines {
+        if line.trim_end() == "---" {
+            return (&text[start..offset], &text[offset + line.len()..]);
+        }
+        offset += line.len();
+    }
+    ("", text)
+}
+
+/// Parses the subset of YAML used by skill frontmatter: top-level
+/// `key: value` pairs with optional quoting, and `|` / `>` block scalars.
+fn parse_frontmatter(text: &str) -> HashMap<String, String> {
+    let mut fields = HashMap::new();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+        i += 1;
+
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        if line.starts_with([' ', '\t']) {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().to_string();
+        let value = value.trim();
+
+        if value == "|" || value == ">" || value == "|-" || value == ">-" {
+            let mut block = Vec::new();
+            while i < lines.len()
+                && (lines[i].trim().is_empty() || lines[i].starts_with([' ', '\t']))
+            {
+                block.push(lines[i].trim());
+                i += 1;
+            }
+            let sep = if value.starts_with('|') { "\n" } else { " " };
+            fields.insert(key, block.join(sep).trim().to_string());
+        } else {
+            fields.insert(key, unquote(value));
+        }
+    }
+
+    fields
+}
+
+fn unquote(value: &str) -> String {
+    let value = strip_comment(value);
+    if value.len() >= 2 {
+        if let Some(inner) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+            return inner.replace("\\\"", "\"").replace("\\\\", "\\");
+        }
+        if let Some(inner) = value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')) {
+            return inner.replace("''", "'");
+        }
+    }
+    value.to_string()
+}
+
+fn strip_comment(value: &str) -> &str {
+    if value.starts_with(['"', '\'']) {
+        return value;
+    }
+    match value.find(" #") {
+        Some(i) => value[..i].trim_end(),
+        None => value,
+    }
+}

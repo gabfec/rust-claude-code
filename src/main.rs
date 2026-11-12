@@ -3,6 +3,8 @@ use clap::Parser;
 use serde_json::{Value, json};
 use std::{env, fs, process::{self, Command}};
 
+mod skills;
+
 #[derive(Parser)]
 #[command(author, version, about)]
 struct Args {
@@ -28,10 +30,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client = Client::with_config(config);
 
-    let mut messages = vec![json!({
+    let skills = skills::discover();
+
+    let mut messages = Vec::new();
+    if !skills.is_empty() {
+        messages.push(json!({
+            "role": "system",
+            "content": skills::system_prompt(&skills)
+        }));
+    }
+    messages.push(json!({
         "role": "user",
         "content": args.prompt
-    })];
+    }));
 
     let tools = json!([
         {
