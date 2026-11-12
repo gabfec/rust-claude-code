@@ -15,8 +15,13 @@ const MODEL: &str = "anthropic/claude-haiku-4.5";
 
 const LSP_SYSTEM_PROMPT: &str = "A language server is connected. Use the LSP tool \
 to find where a symbol is defined (goToDefinition) or everything that references it \
-(findReferences); its line and character inputs are 1-based. Make every file edit \
-with the Write tool so the language server sees the updated code.";
+(findReferences); its line and character inputs are 1-based. Take positions from \
+tool results rather than counting lines yourself: edits move symbols, so after \
+editing, rerun goToDefinition from a call site to get a definition's current \
+position, then query findReferences at exactly that position. Make every file edit \
+with the Write tool so the language server sees the updated code. Tool results may \
+end with <new-diagnostics> reported by the language server for any file; treat them \
+as feedback on your edits and fix the issues they describe.";
 
 #[derive(Parser)]
 #[command(author, version, about)]
@@ -37,6 +42,8 @@ impl Agent {
     /// the model answers without calling a tool, and returns that answer.
     async fn run(&self, messages: &mut Vec<Value>, tools: &Value) -> Result<String, Box<dyn Error>> {
         loop {
+            self.attach_diagnostics(messages);
+
             let response: Value = self
                 .client
                 .chat()
@@ -74,6 +81,25 @@ impl Agent {
         }
     }
 
+    /// Appends language-server diagnostics the model hasn't seen yet to
+    /// the latest tool result, so it can repair its edits.
+    fn attach_diagnostics(&self, messages: &mut [Value]) {
+        let Some(lsp) = &self.lsp else {
+            return;
+        };
+        if let Err(e) = lsp.poll_diagnostics() {
+            eprintln!("Failed to read LSP diagnostics: {}", e);
+        }
+
+        let Some(last) = messages.last_mut().filter(|m| m["role"] == "tool") else {
+            return;
+        };
+        if let Some(report) = lsp.take_new_diagnostics() {
+            let content = last["content"].as_str().unwrap_or("");
+            last["content"] = json!(format!("{}\n\n{}", content, report));
+        }
+    }
+
     async fn execute_tool(&self, name: &str, arguments: &Value) -> Result<String, Box<dyn Error>> {
         let content = match name {
             "Read" => {
@@ -98,7 +124,9 @@ impl Agent {
             "Bash" => {
                 let command = arguments["command"].as_str().unwrap_or("");
                 let output = Command::new("sh").arg("-c").arg(command).output()?;
-                String::from_utf8_lossy(&output.stdout).to_string()
+                let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+                text.push_str(&String::from_utf8_lossy(&output.stderr));
+                text
             }
             "LSP" if self.lsp.is_some() => {
                 let lsp = self.lsp.as_ref().unwrap();

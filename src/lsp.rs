@@ -1,11 +1,16 @@
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::lsp_client::LspClient;
+
+/// How long one settle read waits for new notifications, and how many
+/// reads a settle makes at most before a Write notification.
+const SETTLE_WAIT_MS: u64 = 300;
+const SETTLE_ROUNDS: usize = 5;
 
 /// The language server connection plus the state of the documents it
 /// has been sent on this connection.
@@ -14,6 +19,25 @@ pub struct Lsp {
     root: PathBuf,
     /// URI -> version last sent for every open document.
     versions: Mutex<HashMap<String, i64>>,
+    diagnostics: Mutex<DiagnosticsState>,
+}
+
+#[derive(Default)]
+struct DiagnosticsState {
+    /// Cursor for the next read of the client's notification queue.
+    cursor: Value,
+    /// URI -> issues in the latest current report for that file, all
+    /// of which have been shown or queued for the model.
+    shown: HashMap<String, HashSet<Diagnostic>>,
+    /// Issues from current reports that the model hasn't seen yet.
+    pending: Vec<(String, Diagnostic)>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct Diagnostic {
+    line: u64,
+    character: u64,
+    message: String,
 }
 
 /// A zero-based position in a document, as LSP counts it.
@@ -29,7 +53,127 @@ impl Lsp {
             client,
             root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             versions: Mutex::new(HashMap::new()),
+            diagnostics: Mutex::new(DiagnosticsState {
+                cursor: json!(0),
+                ..Default::default()
+            }),
         }
+    }
+
+    /// Reads queued `publishDiagnostics` reports. A report whose version
+    /// differs from the last one sent for that file is stale and ignored.
+    /// A current report replaces the file's previous one, and its issues
+    /// that weren't in the previous report are queued for the model.
+    ///
+    /// Queued issues stay queued even if a later report clears them: the
+    /// model must see every current diagnostic, and a report can arrive
+    /// and be superseded between two model requests.
+    pub fn poll_diagnostics(&self) -> Result<(), Box<dyn Error>> {
+        self.read_notifications(0).map(|_| ())
+    }
+
+    /// Reads the notification queue, waiting up to `timeout_ms` for new
+    /// ones, records their diagnostic reports, and returns how many
+    /// notifications arrived.
+    fn read_notifications(&self, timeout_ms: u64) -> Result<usize, Box<dyn Error>> {
+        let mut state = self.diagnostics.lock().unwrap();
+        let response = self.client.call(
+            "notifications",
+            &json!({ "after": state.cursor, "timeoutMs": timeout_ms }),
+        )?;
+        if !response["cursor"].is_null() {
+            state.cursor = response["cursor"].clone();
+        }
+
+        let notifications = response["notifications"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        let versions = self.versions.lock().unwrap();
+        for notification in notifications {
+            if notification["method"] != "textDocument/publishDiagnostics" {
+                continue;
+            }
+            let params = &notification["params"];
+            let Some(uri) = params["uri"].as_str() else {
+                continue;
+            };
+            if let (Some(reported), Some(sent)) = (params["version"].as_i64(), versions.get(uri)) {
+                if reported != *sent {
+                    continue;
+                }
+            }
+
+            let issues: Vec<Diagnostic> = params["diagnostics"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|d| {
+                    Some(Diagnostic {
+                        line: d["range"]["start"]["line"].as_u64()?,
+                        character: d["range"]["start"]["character"].as_u64()?,
+                        message: d["message"].as_str()?.to_string(),
+                    })
+                })
+                .collect();
+
+            let previous = state.shown.remove(uri).unwrap_or_default();
+            for issue in &issues {
+                let queued = state.pending.iter().any(|(u, d)| u == uri && d == issue);
+                if !previous.contains(issue) && !queued {
+                    state.pending.push((uri.to_string(), issue.clone()));
+                }
+            }
+            state.shown.insert(uri.to_string(), issues.into_iter().collect());
+        }
+        Ok(notifications.len())
+    }
+
+    /// Lets the server finish publishing reports for earlier changes
+    /// before a document's version moves on: reads the queue with a short
+    /// wait until a read comes back empty. Reports read now are judged
+    /// against the version they were published for; read after the next
+    /// notification, they would look stale.
+    fn settle(&self) {
+        for _ in 0..SETTLE_ROUNDS {
+            match self.read_notifications(SETTLE_WAIT_MS) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(e) => {
+                    eprintln!("Failed to read LSP diagnostics: {}", e);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Formats the queued issues, grouped by file, and clears the queue.
+    /// Returns `None` when there is nothing new.
+    pub fn take_new_diagnostics(&self) -> Option<String> {
+        let pending = std::mem::take(&mut self.diagnostics.lock().unwrap().pending);
+        if pending.is_empty() {
+            return None;
+        }
+
+        let mut files: Vec<(&String, Vec<&Diagnostic>)> = Vec::new();
+        for (uri, issue) in &pending {
+            match files.iter_mut().find(|(u, _)| *u == uri) {
+                Some((_, group)) => group.push(issue),
+                None => files.push((uri, vec![issue])),
+            }
+        }
+
+        let sections: Vec<String> = files
+            .iter()
+            .map(|(uri, issues)| {
+                let lines: Vec<String> = issues
+                    .iter()
+                    .map(|d| format!("  [Line {}:{}] {}", d.line + 1, d.character + 1, d.message))
+                    .collect();
+                format!("{}:\n{}", self.relative(uri), lines.join("\n"))
+            })
+            .collect();
+        Some(format!(
+            "<new-diagnostics>The following new diagnostic issues were detected:\n\n{}</new-diagnostics>",
+            sections.join("\n\n")
+        ))
     }
 
     /// Executes an `LSP` tool call and returns its result text.
@@ -92,6 +236,9 @@ impl Lsp {
             return Ok(());
         };
         let uri = path_to_uri(&path);
+
+        self.settle();
+
         let current = self.versions.lock().unwrap().get(&uri).copied();
 
         let version = match current {
