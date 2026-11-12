@@ -44,13 +44,63 @@ pub fn discover() -> Vec<Skill> {
     dirs.iter().filter_map(|d| Skill::load(d)).collect()
 }
 
-/// Expands a `/name` prompt into the invoked skill's body. Returns
-/// `None` when the prompt doesn't start with a known skill name.
+/// Expands a `/name args...` prompt into the invoked skill's body,
+/// with the argument placeholders substituted. Returns `None` when the
+/// prompt doesn't start with a known skill name.
 pub fn expand_prompt(skills: &[Skill], prompt: &str) -> Option<String> {
-    let first = prompt.split_whitespace().next()?;
+    let prompt = prompt.trim_start();
+    let (first, rest) = prompt.split_once(char::is_whitespace).unwrap_or((prompt, ""));
     let name = first.strip_prefix('/')?;
     let skill = skills.iter().find(|s| s.name == name)?;
-    Some(skill.body.clone())
+    Some(substitute_arguments(&skill.body, rest.trim()))
+}
+
+/// Replaces `$ARGUMENTS`, `$ARGUMENTS[N]` and `$N` in a skill body.
+/// Missing positional arguments become empty strings.
+pub fn substitute_arguments(body: &str, arguments: &str) -> String {
+    let args: Vec<&str> = arguments.split_whitespace().collect();
+    let positional = |index: &str| -> &str {
+        index
+            .parse::<usize>()
+            .ok()
+            .and_then(|i| args.get(i).copied())
+            .unwrap_or("")
+    };
+
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(pos) = rest.find('$') {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 1..];
+
+        if let Some(tail) = after.strip_prefix("ARGUMENTS") {
+            if let Some(indexed) = tail.strip_prefix('[') {
+                if let Some(close) = indexed.find(']') {
+                    let index = &indexed[..close];
+                    if !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()) {
+                        out.push_str(positional(index));
+                        rest = &indexed[close + 1..];
+                        continue;
+                    }
+                }
+            }
+            out.push_str(arguments);
+            rest = tail;
+            continue;
+        }
+
+        let digits = after.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if digits > 0 {
+            out.push_str(positional(&after[..digits]));
+            rest = &after[digits..];
+            continue;
+        }
+
+        out.push('$');
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 pub fn system_prompt(skills: &[Skill]) -> String {
@@ -142,5 +192,35 @@ fn strip_comment(value: &str) -> &str {
     match value.find(" #") {
         Some(i) => value[..i].trim_end(),
         None => value,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn substitutes_all_placeholder_kinds() {
+        let body = "Deploy to $0 in region $1. Full request was: $ARGUMENTS ($ARGUMENTS[1])";
+        assert_eq!(
+            substitute_arguments(body, "staging eu-west"),
+            "Deploy to staging in region eu-west. Full request was: staging eu-west (eu-west)"
+        );
+    }
+
+    #[test]
+    fn missing_arguments_become_empty() {
+        assert_eq!(substitute_arguments("[$ARGUMENTS][$0][$ARGUMENTS[3]]", ""), "[][][]");
+        assert_eq!(substitute_arguments("costs $ 5", "x"), "costs $ 5");
+    }
+
+    #[test]
+    fn splits_frontmatter_from_body() {
+        let text = "---\nname: apple\ndescription: \"Deploys: apple\"\ncontext: fork\n---\n\nBody here\n";
+        let (fm, body) = split_frontmatter(text);
+        let fields = parse_frontmatter(fm);
+        assert_eq!(fields["description"], "Deploys: apple");
+        assert_eq!(fields["context"], "fork");
+        assert_eq!(body.trim(), "Body here");
     }
 }
