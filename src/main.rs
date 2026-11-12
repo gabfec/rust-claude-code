@@ -3,9 +3,11 @@ use clap::Parser;
 use serde_json::{Value, json};
 use std::{env, error::Error, fs, process::{self, Command}};
 
+mod lsp;
 mod lsp_client;
 mod skills;
 
+use lsp::Lsp;
 use lsp_client::LspClient;
 use skills::Skill;
 
@@ -22,7 +24,7 @@ struct Agent {
     client: Client<OpenAIConfig>,
     skills: Vec<Skill>,
     tools: Value,
-    lsp: Option<LspClient>,
+    lsp: Option<Lsp>,
 }
 
 impl Agent {
@@ -84,7 +86,10 @@ impl Agent {
                 let output = Command::new("sh").arg("-c").arg(command).output()?;
                 String::from_utf8_lossy(&output.stdout).to_string()
             }
-            "LSP" if self.lsp.is_some() => "LSP is not implemented yet".to_string(),
+            "LSP" if self.lsp.is_some() => {
+                let lsp = self.lsp.as_ref().unwrap();
+                lsp.execute(arguments)
+            }
             "Skill" => {
                 let name = arguments["name"].as_str().unwrap_or("");
                 let skill_args = arguments["args"].as_str().unwrap_or("");
@@ -270,7 +275,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         client: Client::with_config(config),
         skills: skills::discover(),
         tools,
-        lsp,
+        lsp: lsp.map(Lsp::new),
     };
 
     let mut messages = Vec::new();
