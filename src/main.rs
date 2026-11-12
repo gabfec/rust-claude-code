@@ -39,9 +39,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "content": skills::system_prompt(&skills)
         }));
     }
+    let user_content = skills::expand_prompt(&skills, &args.prompt).unwrap_or(args.prompt);
     messages.push(json!({
         "role": "user",
-        "content": args.prompt
+        "content": user_content
     }));
 
     let tools = json!([

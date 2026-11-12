@@ -44,6 +44,15 @@ pub fn discover() -> Vec<Skill> {
     dirs.iter().filter_map(|d| Skill::load(d)).collect()
 }
 
+/// Expands a `/name` prompt into the invoked skill's body. Returns
+/// `None` when the prompt doesn't start with a known skill name.
+pub fn expand_prompt(skills: &[Skill], prompt: &str) -> Option<String> {
+    let first = prompt.split_whitespace().next()?;
+    let name = first.strip_prefix('/')?;
+    let skill = skills.iter().find(|s| s.name == name)?;
+    Some(skill.body.clone())
+}
+
 pub fn system_prompt(skills: &[Skill]) -> String {
     let mut prompt = String::from("You have access to the following skills:\n\n");
     for skill in skills {
